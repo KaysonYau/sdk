@@ -5540,6 +5540,104 @@ bool MegaClient::sc_checkActionPacketPreservePos(JSON& json, const Node* lastAPD
     return true;
 }
 
+bool MegaClient::sc_readAPNode(JSON* json, const JSON& originAPJson)
+{
+    // Read and process a single actionpacket node from the streaming JSON parser
+    // This function handles individual actionpacket objects within the "a" array
+    // in a streaming manner, avoiding the need to load all actionpackets into memory at once
+    if (!json)
+    {
+        LOG_err << "Invalid json data.";
+        return false;
+    }
+    
+    std::shared_ptr<Node> lastAPDeletedNode;
+    
+    // must confirm this logic.
+    if (!sc_checkActionPacketPreservePos(const_cast<JSON&>(originAPJson), lastAPDeletedNode.get()))
+    {
+        return false;
+    }
+
+    if (json->enterobject())
+    {
+        nameid name;
+        bool isSelfOriginating = Utils::startswith(originAPJson.pos, "\"i\":\"") &&
+                                             !memcmp(originAPJson.pos + 5, sessionid, sizeof sessionid) &&
+                                                originAPJson.pos[5 + sizeof sessionid] == '"';
+        while ((name = json->getnameid()) != EOO)
+        {
+            sc_procActionPacketWithoutCommonTags(*json, name, isSelfOriginating, lastAPDeletedNode);
+        }
+    }
+    
+    return true;
+}
+
+m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
+{
+    // Process a chunk of actionpacket data using streaming JSON parsing
+    // This function sets up filters for JSONSplitter to handle different parts
+    // of the actionpacket structure incrementally, improving performance for
+    // large responses containing many actionpackets
+    // prevent the sync thread from looking things up while we change the tree
+    std::unique_lock<recursive_mutex> nodeTreeIsChanging(nodeTreeMutex);
+
+    bool originalAC = actionpacketsCurrent;
+    actionpacketsCurrent = false;
+    JSON originAPJson(chunk);
+
+    CodeCounter::ScopeTimer ccst(performanceStats.scProcessingTime);
+    static std::map<std::string, JSONSplitter::FilterCallback> filters =
+    {
+        // Process individual actionpacket objects within the "a" array
+        {"{[a{", [this, originAPJson](JSON* json) {
+            if (!sc_readAPNode(json, originAPJson))
+            {
+                return JSONSplitter::CallbackResult::FAILED;
+            }
+            return JSONSplitter::ResultFromBool(json->leaveobject());
+        }},
+        
+        // Handle end of actionpacket array
+         {"{[a", [](JSON* json) {
+            json->enterarray();
+            return JSONSplitter::ResultFromBool(json->leavearray());
+        }},
+        
+        // Process "w" field (web notification URL)
+        {"{\"w", [this](JSON* json) {
+            json->storeobject(&scnotifyurl);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process "ir" field (incomplete response flag)
+        {"{\"ir", [this](JSON* json) {
+            // when spoonfeeding is in action, there may still be more actionpackets to be delivered.
+            insca_notlast = (json->getint() == 1);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process "sn" field (sequence number)
+        {"{\"sn", [this](JSON* json) {
+            sc_storeSn(*json);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        // Handle end of parsing (empty object)
+        {"{", [this, &nodeTreeIsChanging, originalAC](JSON* json) {
+            if (json) {
+                LOG_debug << "parsing finished.";
+            }
+            sc_procEoo(nodeTreeIsChanging, originalAC);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+    };
+
+    mScJsonSplitter.clear();
+    m_off_t consumed = mScJsonSplitter.processChunk(&filters, chunk);
+    return consumed;
+}
+
 bool MegaClient::sc_procActionPacket(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode)
 {
     if (json.enterobject())
@@ -25111,7 +25209,109 @@ void MegaClient::setMegaURL(const std::string& url)
 
 void MegaClient::handleScChannel()
 {
-    return handleScNonStreaming();
+    // Main entry point for processing Server-Client (SC) channel messages
+    // Now uses streaming chunk processing for better memory efficiency
+    return HandleScNonStreamingChunk();
+    //return handleScNonStreaming();
+}
+
+void MegaClient::HandleScNonStreamingChunk() {
+    // Handle processing of SC (Server-Client) channel chunks in a streaming manner
+    // This function processes incoming actionpackets incrementally using JSONSplitter
+    // instead of parsing the entire JSON response at once, improving memory efficiency
+    // for large actionpacket arrays
+    if (!jsonsc.pos && !pendingscUserAlerts && pendingsc)
+    {
+#ifdef MEGASDK_DEBUG_TEST_HOOKS_ENABLED
+        if (globalMegaTestHooks.interceptSCRequest)
+        {
+            globalMegaTestHooks.interceptSCRequest(pendingsc);
+        }
+#endif
+
+        switch (static_cast<reqstatus_t>(pendingsc->status))
+        {
+            case REQ_SUCCESS:
+                pendingscTimedOut = false;
+                if (pendingsc->contentlength == 1 && pendingsc->in.size() &&
+                    pendingsc->in[0] == '0')
+                {
+                    LOG_debug << "SC keep-alive received";
+                    pendingsc.reset();
+                    btsc.reset();
+                    break;
+                }
+
+                if (pendingsc && pendingsc->in.size() && !scpaused)
+                {
+                    insca = false;
+                    insca_notlast = false;
+                    // Process the chunk using streaming JSON parser
+                    // This handles actionpacket arrays incrementally
+                    m_off_t consumed = sc_procChunkActionPacket(pendingsc->in.data());
+                    JSON_CHUNK_CONSUMED
+                        << "Consumed a chunk of " << consumed << " bytes. ";
+                    // Remove the processed bytes from the pending buffer
+                    pendingsc->purge(static_cast<size_t>(consumed));
+                    
+                    app->notify_network_activity(NetworkActivityChannel::SC,
+                                                 NetworkActivityType::REQUEST_RECEIVED,
+                                                 API_OK);
+                    
+                    // Check if JSONSplitter has finished processing the entire response
+                    if (mScJsonSplitter.hasFinished())
+                    {
+                        jsonsc.pos = nullptr;
+                        pendingsc.reset();
+                        btsc.reset();
+                        // upon reception of action packets, if the cs request is waiting for a retry
+                        // and it failed due to -3 or -4 error from API, we can abort the backoff
+                        if (reqs.retryReasonIsApi())
+                        {
+                            btcs.reset();
+                        }
+                    }
+                    // Handle case where JSONSplitter has paused (incomplete data)
+                    // TODO: Implement logic to handle paused state, possibly wait for more data
+                    else if (mScJsonSplitter.hasPaused())
+                    {
+                       //TODO
+                    }
+                    // Handle case where JSONSplitter has failed to parse
+                    else if (mScJsonSplitter.hasFailed())
+                    {
+                        handleScErrorInSuccessState();
+                    }
+                    break;
+                }
+                else
+                {
+                    handleScErrorInSuccessState();
+                }
+
+                [[fallthrough]];
+            case REQ_FAILURE:
+                handleScInFailureState();
+                break;
+
+            case REQ_INFLIGHT:
+                if (!pendingscTimedOut &&
+                    Waiter::ds >= (pendingsc->lastdata + HttpIO::SCREQUESTTIMEOUT))
+                {
+                    LOG_debug << clientname << "sc timeout expired at ds: " << Waiter::ds
+                              << " and lastdata ds: " << pendingsc->lastdata;
+                    // In almost all cases the server won't take more than SCREQUESTTIMEOUT seconds.
+                    // But if it does, break the cycle of endless requests for the same thing
+                    pendingscTimedOut = true;
+                    pendingsc.reset();
+                    btsc.reset();
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return;
 }
 
 void MegaClient::handleScNonStreaming()

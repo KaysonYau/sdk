@@ -51,6 +51,7 @@
 #include <mega/common/client_adapter.h>
 #include <mega/file_service/file_service.h>
 #include <mega/fuse/common/service.h>
+#include <mega/json.h>
 
 #include <optional>
 
@@ -1884,6 +1885,10 @@ public:
     // server-client command processing
     void sc_storeSn(JSON& json);
     void sc_procEoo(std::unique_lock<recursive_mutex>& nodeTreeIsChanging, bool originalAC);
+    
+    // read single actionpacket node.
+    bool sc_readAPNode(JSON* json, const JSON& originAPJson);
+    m_off_t sc_procChunkActionPacket(const char* chunk);
     // process an action packet
     bool sc_procActionPacket(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode);
     // process an action packet excluding a, i and st tags
@@ -2141,6 +2146,9 @@ public:
 
     // records last seqTag, with allowance for future fields also
     ScDbStateRecord mScDbStateRecord;
+
+    // 用于流式处理后台返回给客户端的actionpackets的JSON解析器
+    JSONSplitter mScJsonSplitter;
 
     // Server-MegaClient request JSON and processing state flag ("processing a element")
     JSON jsonsc;
@@ -2570,6 +2578,8 @@ public:
     // Entrance for server-client channel processing
     void handleScChannel();
 
+    void HandleScNonStreamingChunk();
+    
     // Process states and prepare data
     void handleScNonStreaming();
 
