@@ -5540,47 +5540,14 @@ bool MegaClient::sc_checkActionPacketPreservePos(JSON& json, const Node* lastAPD
     return true;
 }
 
-bool MegaClient::sc_readAPNode(JSON* json, const JSON& originAPJson)
-{
-    // Read and process a single actionpacket node from the streaming JSON parser
-    // This function handles individual actionpacket objects within the "a" array
-    // in a streaming manner, avoiding the need to load all actionpackets into memory at once
-    if (!json)
-    {
-        LOG_err << "Invalid json data.";
-        return false;
-    }
-    
-    std::shared_ptr<Node> lastAPDeletedNode;
-    
-    // must confirm this logic.
-    if (!sc_checkActionPacketPreservePos(const_cast<JSON&>(originAPJson), lastAPDeletedNode.get()))
-    {
-        return false;
-    }
-
-    if (json->enterobject())
-    {
-        nameid name;
-        bool isSelfOriginating = Utils::startswith(originAPJson.pos, "\"i\":\"") &&
-                                             !memcmp(originAPJson.pos + 5, sessionid, sizeof sessionid) &&
-                                                originAPJson.pos[5 + sizeof sessionid] == '"';
-        while ((name = json->getnameid()) != EOO)
-        {
-            sc_procActionPacketWithoutCommonTags(*json, name, isSelfOriginating, lastAPDeletedNode);
-        }
-    }
-    
-    return true;
-}
-
 m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
 {
     // Process a chunk of actionpacket data using streaming JSON parsing
     // This function sets up filters for JSONSplitter to handle different parts
     // of the actionpacket structure incrementally, improving performance for
     // large responses containing many actionpackets
-    // prevent the sync thread from looking things up while we change the tree
+    
+    // Prevent the sync thread from looking things up while we change the tree
     std::unique_lock<recursive_mutex> nodeTreeIsChanging(nodeTreeMutex);
 
     bool originalAC = actionpacketsCurrent;
@@ -5590,12 +5557,114 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
     CodeCounter::ScopeTimer ccst(performanceStats.scProcessingTime);
     static std::map<std::string, JSONSplitter::FilterCallback> filters =
     {
-        // Process individual actionpacket objects within the "a" array
-        {"{[a{", [this, originAPJson](JSON* json) {
-            if (!sc_readAPNode(json, originAPJson))
+        // Process end of individual actionpacket objects within the "a" array
+        // Path: {[a{ - matches the end of each actionpacket object
+        {"{[a{", [](JSON* json) {
+            return JSONSplitter::ResultFromBool(json->leaveobject());
+        }},
+        
+        // Process the "a" attribute (action type) within each actionpacket
+        // Path: {[a{"a - matches actionpacket type field
+        {"{[a{\"a", [this, originAPJson](JSON* json) {
+            if (!sc_checkActionPacketPreservePos(const_cast<JSON&>(originAPJson), chunkLastAPDeletedNode.get()))
             {
-                return JSONSplitter::CallbackResult::FAILED;
+                return JSONSplitter::CallbackResult::SUCCESS;
             }
+            
+            if (json)
+            {
+                nameid name = json->getnameidvalue();
+                if (name != 't') {
+                    bool isSelfOriginating = Utils::startswith(originAPJson.pos, "\"i\":\"") &&
+                                             !memcmp(originAPJson.pos + 5, sessionid, sizeof sessionid) &&
+                                            originAPJson.pos[5 + sizeof sessionid] == '"';
+                    sc_procActionPacketWithoutCommonTags(*json, name, isSelfOriginating, chunkLastAPDeletedNode);
+                    json->leaveobject();
+                }
+            }
+            
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process user array in actionpacket (updates for existing users)
+        // Path: {[a{\"u - matches user updates within actionpackets
+        {"{[a{\"u", [this](JSON* json) {
+            readusers(json, true);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process originating user field in actionpacket
+        // Path: {[a{\"ou - matches the originating user identifier
+        {"{[a{\"ou", [this](JSON* json) {
+            chunkOriginatingUser = json->gethandle(USERHANDLE);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process individual node elements within the "f" array in tree operations ("t")
+        // Path: {[a{{t[f{ - matches each file/folder node in the tree structure
+        // This handles streaming of potentially large node arrays incrementally
+        {"{[a{{t[f{", [this](JSON* json) {
+            auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen));
+            int notify = 1;
+            putsource_t source = putnodesCmd ? putnodesCmd->source : PUTNODES_APP;
+            vector<NewNode>* nn = putnodesCmd ? &putnodesCmd->nn : nullptr;
+            bool modifiedByThisClient = putnodesCmd ? putnodesCmd->tag != 0 : false;
+            bool applykeys = putnodesCmd ? true : false;
+            int e = readnode(json,
+                                        notify,
+                                        source,
+                                        nn,
+                                        modifiedByThisClient,
+                                        applykeys,
+                                        chunkMissingParentNodes,
+                                        chunkPreviousHandleForAlert,
+            #ifdef ENABLE_SYNC
+                             &chunkAllParents);
+            #else
+                            nullptr);
+            #endif
+            if (e != 1)
+            {
+                LOG_err << "Parsing error in readnodes: " << e;
+            }
+            
+            return JSONSplitter::ResultFromBool(e == 1 && json->leaveobject());
+        }},
+        
+        // Process end of file array in tree object - perform post-processing of nodes
+        // Path: {[a{{t[f - matches the end of the file array in tree operations
+        // Finalizes node processing, checks for orphans, and triggers sync operations
+        {"{[a{{t[f", [this](JSON* json) {
+            mergenewshares(1);
+            mNodeManager.checkOrphanNodes(chunkMissingParentNodes);
+
+            #ifdef ENABLE_SYNC
+                for (NodeHandle p : chunkAllParents)
+                {
+                    syncs.triggerSync(p);
+                }
+            #endif
+            json->enterarray();
+            return JSONSplitter::ResultFromBool(json->leavearray());
+        }},
+        
+        // Process user array in tree object updates
+        // Path: {[a{{t[u - matches the user array within tree operations
+        // Note: Currently processed as a whole array rather than individual elements
+        // (In theory, individual user elements could be streamed, but this is deferred
+        // as user counts are typically small, so bulk processing is acceptable)
+        {"{[a{{t[u", [this](JSON* json) {
+            readusers(json, true);
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }},
+        
+        // Process end of tree object in actionpacket
+        // Path: {[a{{t - matches the end of tree operations
+        {"{[a{{t", [this](JSON* json) {
+            // Finalize tree object processing: merge shares and handle user alerts for shared nodes
+            mergenewshares(1);
+            if (!loggedIntoFolder())
+                useralerts.convertNotedSharedNodes(true, chunkOriginatingUser);
             return JSONSplitter::ResultFromBool(json->leaveobject());
         }},
         
@@ -5633,8 +5702,10 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
         }},
     };
 
-    mScJsonSplitter.clear();
-    m_off_t consumed = mScJsonSplitter.processChunk(&filters, chunk);
+    // Reset the JSON splitter state to prepare for processing a new chunk
+    chunkJsonSplitter.clear();
+    // Process the chunk with established filters, returning number of bytes consumed
+    m_off_t consumed = chunkJsonSplitter.processChunk(&filters, chunk);
     return consumed;
 }
 
@@ -25259,7 +25330,7 @@ void MegaClient::HandleScNonStreamingChunk() {
                                                  API_OK);
                     
                     // Check if JSONSplitter has finished processing the entire response
-                    if (mScJsonSplitter.hasFinished())
+                    if (chunkJsonSplitter.hasFinished())
                     {
                         jsonsc.pos = nullptr;
                         pendingsc.reset();
@@ -25273,12 +25344,12 @@ void MegaClient::HandleScNonStreamingChunk() {
                     }
                     // Handle case where JSONSplitter has paused (incomplete data)
                     // TODO: Implement logic to handle paused state, possibly wait for more data
-                    else if (mScJsonSplitter.hasPaused())
+                    else if (chunkJsonSplitter.hasPaused())
                     {
                        //TODO
                     }
                     // Handle case where JSONSplitter has failed to parse
-                    else if (mScJsonSplitter.hasFailed())
+                    else if (chunkJsonSplitter.hasFailed())
                     {
                         handleScErrorInSuccessState();
                     }

@@ -1886,8 +1886,6 @@ public:
     void sc_storeSn(JSON& json);
     void sc_procEoo(std::unique_lock<recursive_mutex>& nodeTreeIsChanging, bool originalAC);
     
-    // read single actionpacket node.
-    bool sc_readAPNode(JSON* json, const JSON& originAPJson);
     m_off_t sc_procChunkActionPacket(const char* chunk);
     // process an action packet
     bool sc_procActionPacket(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode);
@@ -2147,8 +2145,15 @@ public:
     // records last seqTag, with allowance for future fields also
     ScDbStateRecord mScDbStateRecord;
 
-    // 用于流式处理后台返回给客户端的actionpackets的JSON解析器
-    JSONSplitter mScJsonSplitter;
+    // JSON parser for streaming processing of actionpackets returned by the server to the client
+    JSONSplitter chunkJsonSplitter;
+    std::shared_ptr<Node> chunkLastAPDeletedNode;
+    handle chunkOriginatingUser;
+#ifdef ENABLE_SYNC
+    set<NodeHandle> chunkAllParents;
+#endif
+    NodeManager::MissingParentNodes chunkMissingParentNodes;
+    handle chunkPreviousHandleForAlert = UNDEF;
 
     // Server-MegaClient request JSON and processing state flag ("processing a element")
     JSON jsonsc;
