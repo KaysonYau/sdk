@@ -11582,7 +11582,6 @@ int main(int argc, char* argv[])
     }
 
     SimpleLogger::setLogLevel(logVerbose);
-    gLogger.logToConsole = true;
     auto gLoggerAddr = &gLogger;
     g_externalLogger.addMegaLogger(&gLogger,
 
