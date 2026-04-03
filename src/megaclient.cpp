@@ -5716,8 +5716,9 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
         }},
 
         // Handle end of actionpacket array
-        {"{[a", [](JSON* json) -> JSONSplitter::CallbackResult {
+        {"{[a", [this](JSON* json) -> JSONSplitter::CallbackResult {
             json->enterarray();
+            sc_checkSequenceTag(string());
             return JSONSplitter::ResultFromBool(json->leavearray());
         }},
 
