@@ -5540,6 +5540,13 @@ bool MegaClient::sc_checkActionPacketPreservePos(JSON& json, const Node* lastAPD
     return true;
 }
 
+bool MegaClient::chunkIsSelfOriginating(const JSON& json)
+{
+    return Utils::startswith(json.pos, "\"i\":\"") &&
+                             !memcmp(json.pos + 5, sessionid, sizeof sessionid) &&
+                json.pos[5 + sizeof sessionid] == '"';
+}
+
 m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
 {
     // Process a chunk of actionpacket data using streaming JSON parsing
@@ -5555,6 +5562,38 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
     JSON originAPJson(chunk);
 
     CodeCounter::ScopeTimer ccst(performanceStats.scProcessingTime);
+    auto singleNodeHandler = [this, &originAPJson](JSON* json) {
+        if (!fetchingnodes && chunkIsSelfOriginating(originAPJson))
+        {
+            return JSONSplitter::CallbackResult::SUCCESS;
+        }
+        auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen));
+        int notify = 1;
+        putsource_t source = putnodesCmd ? putnodesCmd->source : PUTNODES_APP;
+        vector<NewNode>* nn = putnodesCmd ? &putnodesCmd->nn : nullptr;
+        bool modifiedByThisClient = putnodesCmd ? putnodesCmd->tag != 0 : false;
+        bool applykeys = putnodesCmd ? true : false;
+        int e = readnode(json,
+                                    notify,
+                                    source,
+                                    nn,
+                                    modifiedByThisClient,
+                                    applykeys,
+                                    chunkMissingParentNodes,
+                                    chunkPreviousHandleForAlert,
+        #ifdef ENABLE_SYNC
+                         &chunkAllParents);
+        #else
+                        nullptr);
+        #endif
+        if (e != 1)
+        {
+            LOG_err << "Parsing error in readnodes: " << e;
+        }
+        
+        return JSONSplitter::ResultFromBool(e == 1 && json->leaveobject());
+    };
+    
     static std::map<std::string, JSONSplitter::FilterCallback> filters =
     {
         // Process end of individual actionpacket objects within the "a" array
@@ -5565,21 +5604,38 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
         
         // Process the "a" attribute (action type) within each actionpacket
         // Path: {[a{"a - matches actionpacket type field
-        {"{[a{\"a", [this, originAPJson](JSON* json) {
-            if (!sc_checkActionPacketPreservePos(const_cast<JSON&>(originAPJson), chunkLastAPDeletedNode.get()))
-            {
-                return JSONSplitter::CallbackResult::SUCCESS;
+        {"{[a{\"a", [this, &originAPJson](JSON* json) {
+            auto copyAPJson = originAPJson;
+            if (copyAPJson.enterobject() && copyAPJson.getnameid() == makeNameid("a")
+                && copyAPJson.enterarray()) {
+                if (!sc_checkActionPacketPreservePos(const_cast<JSON&>(copyAPJson), chunkLastAPDeletedNode.get()))
+                {
+                    LOG_err << "failed to check actionpacket preserve pos.";
+                    return JSONSplitter::CallbackResult::SUCCESS;
+                }
             }
             
             if (json)
             {
                 nameid name = json->getnameidvalue();
-                if (name != 't') {
-                    bool isSelfOriginating = Utils::startswith(originAPJson.pos, "\"i\":\"") &&
-                                             !memcmp(originAPJson.pos + 5, sessionid, sizeof sessionid) &&
-                                            originAPJson.pos[5 + sizeof sessionid] == '"';
-                    sc_procActionPacketWithoutCommonTags(*json, name, isSelfOriginating, chunkLastAPDeletedNode);
+                if (name != makeNameid("t"))
+                {
+                    sc_procActionPacketWithoutCommonTags(*json, name, chunkIsSelfOriginating(originAPJson), chunkLastAPDeletedNode);
                     json->leaveobject();
+                } else
+                {
+                    if (!statecurrent)
+                    {
+                        fnstats.actionPackets++;
+                    }
+                    if (!loggedIntoFolder())
+                        useralerts.beginNotingSharedNodes();
+                    chunkOriginatingUser = UNDEF;
+                    chunkPreviousHandleForAlert = UNDEF;
+                    #ifdef ENABLE_SYNC
+                    chunkAllParents.clear();
+                    #endif
+                    chunkMissingParentNodes.clear();
                 }
             }
             
@@ -5601,35 +5657,10 @@ m_off_t MegaClient::sc_procChunkActionPacket(const char* chunk)
         }},
         
         // Process individual node elements within the "f" array in tree operations ("t")
-        // Path: {[a{{t[f{ - matches each file/folder node in the tree structure
+        // Path: {[a{{t[f{  - matches each file/folder node in the tree structure
         // This handles streaming of potentially large node arrays incrementally
-        {"{[a{{t[f{", [this](JSON* json) {
-            auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen));
-            int notify = 1;
-            putsource_t source = putnodesCmd ? putnodesCmd->source : PUTNODES_APP;
-            vector<NewNode>* nn = putnodesCmd ? &putnodesCmd->nn : nullptr;
-            bool modifiedByThisClient = putnodesCmd ? putnodesCmd->tag != 0 : false;
-            bool applykeys = putnodesCmd ? true : false;
-            int e = readnode(json,
-                                        notify,
-                                        source,
-                                        nn,
-                                        modifiedByThisClient,
-                                        applykeys,
-                                        chunkMissingParentNodes,
-                                        chunkPreviousHandleForAlert,
-            #ifdef ENABLE_SYNC
-                             &chunkAllParents);
-            #else
-                            nullptr);
-            #endif
-            if (e != 1)
-            {
-                LOG_err << "Parsing error in readnodes: " << e;
-            }
-            
-            return JSONSplitter::ResultFromBool(e == 1 && json->leaveobject());
-        }},
+        {"{[a{{t[f{", singleNodeHandler},
+        {"{[a{{t[f2{", singleNodeHandler},
         
         // Process end of file array in tree object - perform post-processing of nodes
         // Path: {[a{{t[f - matches the end of the file array in tree operations
@@ -25282,11 +25313,12 @@ void MegaClient::handleScChannel()
 {
     // Main entry point for processing Server-Client (SC) channel messages
     // Now uses streaming chunk processing for better memory efficiency
-    return HandleScNonStreamingChunk();
+    // if we have gray config, we can change streaming parsing or not by gray config.
+    return HandleScStreaming();
     //return handleScNonStreaming();
 }
 
-void MegaClient::HandleScNonStreamingChunk() {
+void MegaClient::HandleScStreaming() {
     // Handle processing of SC (Server-Client) channel chunks in a streaming manner
     // This function processes incoming actionpackets incrementally using JSONSplitter
     // instead of parsing the entire JSON response at once, improving memory efficiency

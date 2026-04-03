@@ -1886,6 +1886,7 @@ public:
     void sc_storeSn(JSON& json);
     void sc_procEoo(std::unique_lock<recursive_mutex>& nodeTreeIsChanging, bool originalAC);
     
+    bool chunkIsSelfOriginating(const JSON& json);
     m_off_t sc_procChunkActionPacket(const char* chunk);
     // process an action packet
     bool sc_procActionPacket(JSON& json, std::shared_ptr<Node>& lastAPDeletedNode);
@@ -2583,7 +2584,7 @@ public:
     // Entrance for server-client channel processing
     void handleScChannel();
 
-    void HandleScNonStreamingChunk();
+    void HandleScStreaming();
     
     // Process states and prepare data
     void handleScNonStreaming();
